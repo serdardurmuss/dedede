@@ -31,6 +31,39 @@ function nblur(v, m, w, h, r) {
   return o;
 }
 
+// 4-bağlantılı bileşenler
+function label(mask, w, h) {
+  const n = w * h, seen = new Uint8Array(n), q = new Int32Array(n), out = [];
+  for (let s0 = 0; s0 < n; s0++) {
+    if (!mask[s0] || seen[s0]) continue;
+    let head = 0, tail = 0, bx0 = w, by0 = h, bx1 = 0, by1 = 0; q[tail++] = s0; seen[s0] = 1;
+    while (head < tail) {
+      const p = q[head++], x = p % w, y = (p / w) | 0;
+      if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y;
+      if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; q[tail++] = p - 1; }
+      if (x < w - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; q[tail++] = p + 1; }
+      if (y > 0 && mask[p - w] && !seen[p - w]) { seen[p - w] = 1; q[tail++] = p - w; }
+      if (y < h - 1 && mask[p + w] && !seen[p + w]) { seen[p + w] = 1; q[tail++] = p + w; }
+    }
+    out.push({ px: q.slice(0, tail), bx0, by0, bx1, by1 });
+  }
+  return out;
+}
+// Maske içindeki pikselleri çevreden doldurur (bbox çevresinde pad kadar pencere).
+function fillBox(rgb, al, mask, w, h, bb, pad, mix, seed) {
+  const x0 = Math.max(0, bb[0] - pad), y0 = Math.max(0, bb[1] - pad), x1 = Math.min(w, bb[2] + pad + 1), y1 = Math.min(h, bb[3] + pad + 1), ww = x1 - x0, hh = y1 - y0;
+  const sub = new Float32Array(ww * hh * 3), kn = new Float32Array(ww * hh); let any = false;
+  for (let y = 0; y < hh; y++) for (let x = 0; x < ww; x++) {
+    const i = (y0 + y) * w + x0 + x, j = y * ww + x; for (let c = 0; c < 3; c++) sub[j * 3 + c] = rgb[i * 3 + c];
+    if (mask[i]) any = true; else kn[j] = al[i];
+  }
+  if (!any) return;
+  const f = inpaint(sub, kn, ww, hh); if (!f) return; addGrain(f, sub, kn, ww, hh, 0.35, seed | 1);
+  for (let y = 0; y < hh; y++) for (let x = 0; x < ww; x++) {
+    const i = (y0 + y) * w + x0 + x; if (mask[i]) for (let c = 0; c < 3; c++) rgb[i * 3 + c] = clamp(rgb[i * 3 + c] * (1 - mix) + f[(y * ww + x) * 3 + c] * mix, 0, 255);
+  }
+}
+
 // ---- tek parça işleme ----
 function processTile(src, ox, oy, w, h, core, X) {
   const { W, H, coef, alphaAt, k, wb, lowAt } = X, n = w * h;
@@ -44,9 +77,10 @@ function processTile(src, ox, oy, w, h, core, X) {
     for (let c = 0; c < 3; c++) rgb[i * 3 + c] = src[i * 4 + c];
     if (a > 0.004 && a < 0.996) {
       evalBg(coef, ox + x, oy + y, W, H, phi, bl); const B = lab2rgb(bl[0], bl[1], bl[2]);
-      for (let c = 0; c < 3; c++) rgb[i * 3 + c] = clamp((rgb[i * 3 + c] - (1 - a) * B[c] * 255) / a, 0, 255);
+      { const g = Math.min(1.5, (1 - a) / a); for (let c = 0; c < 3; c++) rgb[i * 3 + c] = clamp(rgb[i * 3 + c] + g * (rgb[i * 3 + c] - B[c] * 255), 0, 255); }
     }
   }
+  const rgb0 = Float32Array.from(rgb);
   const pm = new Float32Array(n), L = new Float32Array(n);
   for (let i = 0; i < n; i++) { pm[i] = al[i] > 0.95 ? 1 : 0; L[i] = 0.299 * rgb[i * 3] + 0.587 * rgb[i * 3 + 1] + 0.114 * rgb[i * 3 + 2]; }
 
@@ -89,6 +123,58 @@ function processTile(src, ox, oy, w, h, core, X) {
     for (let i = 0; i < n; i++) L[i] = 0.299 * rgb[i * 3] + 0.587 * rgb[i * 3 + 1] + 0.114 * rgb[i * 3 + 2];
   }
 
+  const lumaAll = () => { for (let i = 0; i < n; i++) L[i] = 0.299 * rgb[i * 3] + 0.587 * rgb[i * 3 + 1] + 0.114 * rgb[i * 3 + 2]; };
+  const inCore = c => { const cx = (c.bx0 + c.bx1) >> 1, cy = (c.by0 + c.by1) >> 1; return cx >= core.cx && cx < core.cx + core.cw && cy >= core.cy && cy < core.cy + core.ch; };
+
+  // 1b) Siyah yansımalar: parlak metalle çevrili, yeterince geniş, koyu lekeler (ince gölge hatlarına dokunmaz)
+  let reflections = 0;
+  if (k.dark > 0) {
+    const Lbig = nblur(L, pm, w, h, 14), dk = new Float32Array(n), pn = box(pm, w, h, 8);
+    for (let i = 0; i < n; i++) dk[i] = (pm[i] || pn[i] > 0.5) && L[i] < 0.5 * Lbig[i] && L[i] < 95 ? 1 : 0;   // alfa'sı düşük kalmış koyu yansımalar da dahil
+    const dc = box(dk, w, h, 2), cm = new Uint8Array(n), cmf = new Float32Array(n);
+    for (let i = 0; i < n; i++) { cm[i] = dc[i] > 0.999 ? 1 : 0; cmf[i] = cm[i]; }
+    const d2 = box(cmf, w, h, 2), d6 = box(cmf, w, h, 4), maxA = 0.004 * W * H, accepted = [], acc = new Float32Array(n);
+    for (const c of label(cm, w, h)) {
+      if (c.px.length < 12 || c.px.length > maxA || !inCore(c)) continue;
+      let sl = 0; for (const p of c.px) sl += L[p]; sl /= c.px.length;
+      let rn = 0, rp = 0, rl = 0;
+      for (let y = Math.max(0, c.by0 - 5); y <= Math.min(h - 1, c.by1 + 5); y++) for (let x = Math.max(0, c.bx0 - 5); x <= Math.min(w - 1, c.bx1 + 5); x++) {
+        const i = y * w + x; if (d6[i] > 0.001 && d2[i] <= 0.001) { rn++; if (pm[i]) { rp++; rl += L[i]; } }
+      }
+      if (rn >= 16 && rp / rn >= 0.85 && rl / rp > 1.5 * sl) { accepted.push(c); for (const p of c.px) acc[p] = 1; }
+    }
+    if (accepted.length) {
+      const e2 = box(acc, w, h, 2), e5 = box(acc, w, h, 5), ext = new Uint8Array(n);
+      for (let i = 0; i < n; i++) ext[i] = e2[i] > 0.001 || (e5[i] > 0.001 && dk[i]) ? 1 : 0;
+      for (const c of accepted) fillBox(rgb, al, ext, w, h, [c.bx0, c.by0, c.bx1, c.by1], 22, k.dark, ox * 31 + oy + c.bx0);
+      for (let i = 0; i < n; i++) if (ext[i]) { al[i] = 1; pm[i] = 1; }       // doldurulan alan artık ürünün parçası
+      reflections = accepted.length; lumaAll();
+    }
+  }
+
+  // 1c) Yazı / damga / benek: ürünün derin iç yüzeyinde, seyrek ve küçük koyu-açık izler
+  let marks = 0;
+  if (k.text > 0) {
+    const innerT = box(pm, w, h, 6), Lsm = nblur(L, pm, w, h, 3), st = new Float32Array(n), hf = new Float32Array(n), non = new Float32Array(n), dkn = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const r = Math.abs(L[i] - Lsm[i]); st[i] = innerT[i] > 0.999 && r > k.T2 ? 1 : 0;
+      non[i] = pm[i] && !st[i] ? 1 : 0; hf[i] = non[i] && r > 5 ? 1 : 0; dkn[i] = pm[i] && L[i] < 70 ? 1 : 0;
+    }
+    const hfS = box(hf, w, h, 12), nonS = box(non, w, h, 12), dkS = box(dkn, w, h, 4);   // çevredeki doku şiddeti ve koyu yansıma yakınlığı
+    for (let i = 0; i < n; i++) if (st[i] && (hfS[i] / Math.max(nonS[i], 1e-3) > 0.3 || dkS[i] > 0.002)) st[i] = 0;
+    const dens = box(st, w, h, 12), cm2 = new Uint8Array(n), maxD2 = Math.max(10, Math.round(Math.max(W, H) * 0.012)), acc = new Float32Array(n), keep = [];
+    for (let i = 0; i < n; i++) cm2[i] = st[i] && dens[i] < 0.25 ? 1 : 0;
+    for (const c of label(cm2, w, h)) {
+      if (c.px.length < 2 || Math.max(c.bx1 - c.bx0, c.by1 - c.by0) > maxD2 || !inCore(c)) continue;
+      keep.push(c); for (const p of c.px) acc[p] = 1;
+    }
+    if (keep.length) {
+      const e = box(acc, w, h, 1), ext = new Uint8Array(n); for (let i = 0; i < n; i++) ext[i] = e[i] > 0.001 ? 1 : 0;
+      for (const c of keep) fillBox(rgb, al, ext, w, h, [c.bx0, c.by0, c.bx1, c.by1], 14, 0.92, ox * 17 + oy + c.bx0);
+      marks = keep.length; lumaAll();
+    }
+  }
+
   // 2) Renk ve ışıltı
   const lab = new Float32Array(3), A = new Float32Array(n), B_ = new Float32Array(n), LL = new Float32Array(n);
   for (let i = 0; i < n; i++) {
@@ -97,7 +183,7 @@ function processTile(src, ox, oy, w, h, core, X) {
   }
   const Ad = nblur(A, pm, w, h, 2), Bd = nblur(B_, pm, w, h, 2);        // JPEG renk gürültüsünü azalt
   for (let i = 0; i < n; i++) { A[i] = A[i] * 0.4 + Ad[i] * 0.6; B_[i] = B_[i] * 0.4 + Bd[i] * 0.6; }
-  const Lg = nblur(LL, pm, w, h, 1);
+  const Lg = nblur(LL, pm, w, h, 2);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const i = y * w + x; if (al[i] <= 0.004) continue;
     let l = LL[i], a = A[i] - wb[0] * 0.8, b = B_[i] - wb[1] * 0.8;
@@ -108,22 +194,32 @@ function processTile(src, ox, oy, w, h, core, X) {
     l = clamp(t * 100, 0, 100);
     const d = LL[i] - Lg[i], dc = Math.sign(d) * Math.max(0, Math.abs(d) - 0.7);   // keskinlik (gürültüyü büyütmeden)
     l = clamp(l + k.sharp * dc * pm[i], 0, 100);
-    const c = Math.hypot(a, b), sc = 1 + 0.07 * k.amt * (1 - Math.min(1, c / 60)); a *= sc; b *= sc;
+    let c = Math.hypot(a, b);
+    if (c > 10) {                                                          // renkleri oturt: sarı ve gül altın tonlarını standart tona yaklaştır
+      const hd = Math.atan2(b, a) * 57.29578; let best = 0, bd = 1e9;
+      for (const cn of [58, 80]) { const dh = hd - cn; if (Math.abs(dh) < Math.abs(bd)) { bd = dh; best = cn; } }
+      if (Math.abs(bd) < 14) { const nh = (hd - bd * k.settle) / 57.29578; a = c * Math.cos(nh); b = c * Math.sin(nh); }
+    } else if (c < 8) { a *= 0.8; b *= 0.8; }
+    c = Math.hypot(a, b); const sc = 1 + 0.07 * k.amt * (1 - Math.min(1, c / 60)); a *= sc; b *= sc;
     const o = lab2rgb(l, a, b); for (let q = 0; q < 3; q++) rgb[i * 3 + q] = o[q] * 255;
   }
   const out = new Uint8ClampedArray(core.cw * core.ch * 4);
   for (let y = 0; y < core.ch; y++) for (let x = 0; x < core.cw; x++) {
-    const i = (core.cy + y) * w + core.cx + x, j = (y * core.cw + x) * 4;
-    out[j] = rgb[i * 3]; out[j + 1] = rgb[i * 3 + 1]; out[j + 2] = rgb[i * 3 + 2]; out[j + 3] = al[i] * 255;
+    const i = (core.cy + y) * w + core.cx + x, j = (y * core.cw + x) * 4, a = al[i];
+    if (X.keepBg) {                                                       // arka plan olduğu gibi kalır, sadece ürün işlenir
+      if (a <= 0.004) { out[j] = src[i * 4]; out[j + 1] = src[i * 4 + 1]; out[j + 2] = src[i * 4 + 2]; }
+      else for (let c = 0; c < 3; c++) out[j + c] = src[i * 4 + c] + a * (rgb[i * 3 + c] - rgb0[i * 3 + c]);   // orijinal piksel + ürünün payına düşen iyileştirme
+      out[j + 3] = 255;
+    } else { out[j] = rgb[i * 3]; out[j + 1] = rgb[i * 3 + 1]; out[j + 2] = rgb[i * 3 + 2]; out[j + 3] = a * 255; }
   }
-  return { out, specks };
+  return { out, specks, reflections, marks };
 }
 
 // ---- tüm görüntü ----
 // getTile(x,y,w,h) -> RGBA; putTile(x,y,w,h,rgba); small: {px,w,h} küçültülmüş RGBA (en uzun kenar ~320)
-export async function runPipeline({ W, H, getTile, putTile, small, strength = 'orta', lo = 8, soft = 14, fill = true, progress = () => {} }) {
+export async function runPipeline({ W, H, getTile, putTile, small, strength = 'orta', keepBg = true, kx = {}, lo = 8, soft = 14, fill = true, progress = () => {} }) {
   const amt = PRESETS[strength] ?? 1;
-  const k = { amt, speck: 1, T: 7 - 2 * (amt - 1), GT: 5, clarity: 0.22 * amt, sharp: 0.55 * amt };
+  const k = { amt, speck: 1, T: 7 - 2 * (amt - 1), GT: 5, dark: 0.95, text: 1, T2: 18 - 4 * (amt - 1), settle: 0.35 * amt, clarity: 0.28 * amt, sharp: 0.9 * amt, ...kx };
   const coef = fitBackground(small.px, small.w, small.h), dq = new Uint8Array(W * H);
   const nx = Math.ceil(W / TILE), ny = Math.ceil(H / TILE), tot = nx * ny;
   for (let ty = 0; ty < ny; ty++) for (let tx = 0; tx < nx; tx++) {
@@ -142,7 +238,7 @@ export async function runPipeline({ W, H, getTile, putTile, small, strength = 'o
     for (const [xx, yy, wt] of [[x0, y0, (1 - tx) * (1 - ty)], [x1, y0, tx * (1 - ty)], [x0, y1, (1 - tx) * ty], [x1, y1, tx * ty]]) {
       const f = holes.fill[yy * hlw + xx]; if (f === 1) v1 += wt; else if (f === 2) v2 += wt;
     }
-    const s1 = clamp((v1 - .35) / .3, 0, 1), s2 = clamp((v2 - .35) / .3, 0, 1);
+    const s1 = clamp((v1 - .15) / .2, 0, 1), s2 = clamp((v2 - .35) / .3, 0, 1);
     return Math.max(a * (1 - s2), 255 * s1);
   };
   const phi = new Float64Array(10), bl = new Float64Array(3); evalBg(coef, W / 2, H / 2, W, H, phi, bl);
@@ -159,14 +255,14 @@ export async function runPipeline({ W, H, getTile, putTile, small, strength = 'o
     const bi = (A) => (A[y0 * sw + x0] * (1 - tx) + A[y0 * sw + x1] * tx) * (1 - ty) + (A[y1 * sw + x0] * (1 - tx) + A[y1 * sw + x1] * tx) * ty;
     return [bi(Ln), bi(Wn)];
   };
-  const X = { W, H, coef, alphaAt, k, wb, lowAt };
-  let specks = 0;
+  const X = { W, H, coef, alphaAt, k, wb, lowAt, keepBg };
+  let specks = 0, reflections = 0, marks = 0;
   for (let ty = 0; ty < ny; ty++) for (let tx = 0; tx < nx; tx++) {
     const x0 = tx * TILE, y0 = ty * TILE, x1 = Math.min(W, x0 + TILE), y1 = Math.min(H, y0 + TILE);
     const px0 = Math.max(0, x0 - PAD), py0 = Math.max(0, y0 - PAD), px1 = Math.min(W, x1 + PAD), py1 = Math.min(H, y1 + PAD);
     const r = processTile(getTile(px0, py0, px1 - px0, py1 - py0), px0, py0, px1 - px0, py1 - py0, { cx: x0 - px0, cy: y0 - py0, cw: x1 - x0, ch: y1 - y0 }, X);
-    specks += r.specks; putTile(x0, y0, x1 - x0, y1 - y0, r.out);
+    specks += r.specks; reflections += r.reflections; marks += r.marks; putTile(x0, y0, x1 - x0, y1 - y0, r.out);
     progress('Temizleniyor ve parlatılıyor', 1 / 3 + (ty * nx + tx + 1) / tot * 2 / 3); await tick();
   }
-  return { specks };
+  return { specks, reflections, marks };
 }

@@ -23,7 +23,7 @@ function thumb(canvasOrBmp, w, h, max = 600) {
   const g = t.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(canvasOrBmp, 0, 0, t.width, t.height); return t;
 }
 
-async function processOne(file, ui, strength) {
+async function processOne(file, ui, strength, keepBg) {
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }), W = bmp.width, H = bmp.height;
   ui.orig.replaceChildren(thumb(bmp, W, H));
   const src = document.createElement('canvas'); src.width = W; src.height = H;
@@ -35,7 +35,7 @@ async function processOne(file, ui, strength) {
   const out = document.createElement('canvas'); out.width = W; out.height = H;
   const og = out.getContext('2d');
   const r = await runPipeline({
-    W, H, strength, small,
+    W, H, strength, keepBg, small,
     getTile: (x, y, w, h) => sg.getImageData(x, y, w, h).data,
     putTile: (x, y, w, h, rgba) => og.putImageData(new ImageData(rgba, w, h), x, y),
     progress: (label, f) => (ui.meta.firstChild.textContent = `${label}… %${Math.round(f * 100)}`)
@@ -46,14 +46,14 @@ async function processOne(file, ui, strength) {
   const base = file.name.replace(/\.[^.]+$/, '');
   done.push({ name: base + '_temiz.png', blob });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = base + '_temiz.png'; a.textContent = 'PNG indir';
-  ui.meta.replaceChildren(Object.assign(document.createElement('span'), { textContent: `${W}×${H}, ${r.specks} leke/toz temizlendi` }), a);
+  ui.meta.replaceChildren(Object.assign(document.createElement('span'), { textContent: `${W}×${H}: ${r.specks} leke, ${r.reflections} siyah yansıma, ${r.marks} yazı/iz temizlendi` }), a);
 }
 
 $('file').addEventListener('change', async e => {
   const files = [...e.target.files]; if (!files.length || busy) return; busy = true; e.target.value = '';
-  const strength = $('strength').value, cards = files.map(f => addCard(f.name));
+  const strength = $('strength').value, keepBg = $('bgmode').value === 'koru', cards = files.map(f => addCard(f.name));
   for (let i = 0; i < files.length; i++) {
-    try { await processOne(files[i], cards[i], strength); }
+    try { await processOne(files[i], cards[i], strength, keepBg); }
     catch (err) { console.error(err); cards[i].meta.textContent = 'Hata: ' + (err?.message || err); }
   }
   busy = false; $('zip').disabled = !done.length || typeof JSZip === 'undefined';
