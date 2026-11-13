@@ -189,7 +189,9 @@ function processTile(src, ox, oy, w, h, core, X) {
     let l = LL[i], a = A[i] - wb[0] * 0.8, b = B_[i] - wb[1] * 0.8;
     const [lo, wt] = lowAt(ox + x, oy + y);                              // yerel kontrast (netlik)
     l += k.clarity * (l - lo) * (wt / (wt + 0.08));
-    let t = l / 100; t = 0.55 + (t - 0.55) * (1 + 0.10 * k.amt);          // kontrast
+    l = Math.pow(clamp(l, 0, 100) / 100, k.gam) * 100;                     // hedef parlaklığa getir
+    if (l < 55) l += k.floor * (55 - l) * ((55 - l) / 55);                 // siyaha giden gölgeleri aç
+    let t = l / 100; t = 0.55 + (t - 0.55) * (1 + 0.06 * k.amt);          // hafif kontrast
     if (t > 0.75) t += 0.04 * k.amt * (t - 0.75) / 0.25;                  // parlak noktaları ışıt
     l = clamp(t * 100, 0, 100);
     const d = LL[i] - Lg[i], dc = Math.sign(d) * Math.max(0, Math.abs(d) - 0.7);   // keskinlik (gürültüyü büyütmeden)
@@ -197,10 +199,11 @@ function processTile(src, ox, oy, w, h, core, X) {
     let c = Math.hypot(a, b);
     if (c > 10) {                                                          // renkleri oturt: sarı ve gül altın tonlarını standart tona yaklaştır
       const hd = Math.atan2(b, a) * 57.29578; let best = 0, bd = 1e9;
-      for (const cn of [58, 80]) { const dh = hd - cn; if (Math.abs(dh) < Math.abs(bd)) { bd = dh; best = cn; } }
+      for (const cn of [60, 84]) { const dh = hd - cn; if (Math.abs(dh) < Math.abs(bd)) { bd = dh; best = cn; } }
       if (Math.abs(bd) < 14) { const nh = (hd - bd * k.settle) / 57.29578; a = c * Math.cos(nh); b = c * Math.sin(nh); }
     } else if (c < 8) { a *= 0.8; b *= 0.8; }
-    c = Math.hypot(a, b); const sc = 1 + 0.07 * k.amt * (1 - Math.min(1, c / 60)); a *= sc; b *= sc;
+    c = Math.hypot(a, b); if (c > 10) { a *= k.cs; b *= k.cs; c *= k.cs; }
+    const sc = 1 + 0.07 * k.amt * (1 - Math.min(1, c / 60)); a *= sc; b *= sc;
     const o = lab2rgb(l, a, b); for (let q = 0; q < 3; q++) rgb[i * 3 + q] = o[q] * 255;
   }
   const out = new Uint8ClampedArray(core.cw * core.ch * 4);
@@ -210,6 +213,9 @@ function processTile(src, ox, oy, w, h, core, X) {
       if (a <= 0.004) { out[j] = src[i * 4]; out[j + 1] = src[i * 4 + 1]; out[j + 2] = src[i * 4 + 2]; }
       else for (let c = 0; c < 3; c++) out[j + c] = src[i * 4 + c] + a * (rgb[i * 3 + c] - rgb0[i * 3 + c]);   // orijinal piksel + ürünün payına düşen iyileştirme
       out[j + 3] = 255;
+    } else if (X.bgColor) {                                                // referanslardaki gibi düz zemin (beyaz / krem)
+      for (let c = 0; c < 3; c++) out[j + c] = a * rgb[i * 3 + c] + (1 - a) * X.bgColor[c];
+      out[j + 3] = 255;
     } else { out[j] = rgb[i * 3]; out[j + 1] = rgb[i * 3 + 1]; out[j + 2] = rgb[i * 3 + 2]; out[j + 3] = a * 255; }
   }
   return { out, specks, reflections, marks };
@@ -217,9 +223,9 @@ function processTile(src, ox, oy, w, h, core, X) {
 
 // ---- tüm görüntü ----
 // getTile(x,y,w,h) -> RGBA; putTile(x,y,w,h,rgba); small: {px,w,h} küçültülmüş RGBA (en uzun kenar ~320)
-export async function runPipeline({ W, H, getTile, putTile, small, strength = 'orta', keepBg = true, kx = {}, lo = 8, soft = 14, fill = true, progress = () => {} }) {
+export async function runPipeline({ W, H, getTile, putTile, small, strength = 'orta', keepBg = true, bgColor = null, kx = {}, lo = 8, soft = 14, fill = true, progress = () => {} }) {
   const amt = PRESETS[strength] ?? 1;
-  const k = { amt, speck: 1, T: 7 - 2 * (amt - 1), GT: 5, dark: 0.95, text: 1, T2: 18 - 4 * (amt - 1), settle: 0.35 * amt, clarity: 0.28 * amt, sharp: 0.9 * amt, ...kx };
+  const k = { amt, speck: 1, T: 7 - 2 * (amt - 1), GT: 5, dark: 0.95, text: 1, T2: 18 - 4 * (amt - 1), settle: 0.35 * amt, clarity: 0.28 * amt, sharp: 0.9 * amt, floor: 0.75 * Math.min(1.2, amt), gam: 1, cs: 1, ...kx };
   const coef = fitBackground(small.px, small.w, small.h), dq = new Uint8Array(W * H);
   const nx = Math.ceil(W / TILE), ny = Math.ceil(H / TILE), tot = nx * ny;
   for (let ty = 0; ty < ny; ty++) for (let tx = 0; tx < nx; tx++) {
@@ -232,7 +238,7 @@ export async function runPipeline({ W, H, getTile, putTile, small, strength = 'o
   const hk = holes ? holes.k : 1, hlw = holes ? holes.lw : 1, hlh = holes ? Math.ceil(H / hk) : 1;
   const alphaAt = (x, y) => {
     const a = lut[dq[y * W + x]];
-    if (!holes || a >= 200) return a;
+    if (!holes || a >= 235) return a;
     const fx = clamp((x + .5) / hk - .5, 0, hlw - 1), fy = clamp((y + .5) / hk - .5, 0, hlh - 1), x0 = fx | 0, y0 = fy | 0, x1 = Math.min(hlw - 1, x0 + 1), y1 = Math.min(hlh - 1, y0 + 1), tx = fx - x0, ty = fy - y0;
     let v1 = 0, v2 = 0;
     for (const [xx, yy, wt] of [[x0, y0, (1 - tx) * (1 - ty)], [x1, y0, tx * (1 - ty)], [x0, y1, (1 - tx) * ty], [x1, y1, tx * ty]]) {
@@ -244,18 +250,27 @@ export async function runPipeline({ W, H, getTile, putTile, small, strength = 'o
   const phi = new Float64Array(10), bl = new Float64Array(3); evalBg(coef, W / 2, H / 2, W, H, phi, bl);
   const wb = [clamp(bl[1], -8, 8), clamp(bl[2], -8, 8)];
   // düşük çözünürlüklü ürün parlaklığı (yerel kontrast için)
-  const sw = small.w, sh = small.h, Ls = new Float32Array(sw * sh), Ws = new Float32Array(sw * sh), lab = new Float32Array(3);
+  const sw = small.w, sh = small.h, Ls = new Float32Array(sw * sh), Ws = new Float32Array(sw * sh), As = new Float32Array(sw * sh), Bs = new Float32Array(sw * sh), lab = new Float32Array(3);
   for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
     const i = y * sw + x; rgb2lab(small.px[i * 4], small.px[i * 4 + 1], small.px[i * 4 + 2], lab, 0);
-    Ls[i] = lab[0]; Ws[i] = alphaAt(Math.min(W - 1, ((x + .5) / sw * W) | 0), Math.min(H - 1, ((y + .5) / sh * H) | 0)) / 255;
+    Ls[i] = lab[0]; As[i] = lab[1]; Bs[i] = lab[2]; Ws[i] = alphaAt(Math.min(W - 1, ((x + .5) / sw * W) | 0), Math.min(H - 1, ((y + .5) / sh * H) | 0)) / 255;
   }
+  // Referans görsellerden çıkan hedef ton: sarı ~L79, gül ~L72, beyaz metal ~L82; doygunluk ~32
+  const pl = [], cc = [], hu = [];
+  for (let i = 0; i < sw * sh; i++) if (Ws[i] > 0.9) { pl.push(Ls[i]); const c = Math.hypot(As[i], Bs[i]); if (c > 12) { cc.push(c); hu.push(Math.atan2(Bs[i], As[i]) * 57.29578); } }
+  const med = a => { if (!a.length) return null; a.sort((x, y) => x - y); return a[a.length >> 1]; };
+  const Lmed = med(pl) ?? 60, cmed = med(cc), hmed = med(hu), whiteMetal = pl.length > 0 && cc.length < pl.length * 0.25;
+  const target = whiteMetal ? 82 : (hmed !== null && hmed < 70 ? 72 : 79);
+  const g0 = Math.min(1, Math.log(target / 100) / Math.log(clamp(Lmed, 20, 97) / 100));
+  k.gam = 1 + (clamp(g0, 0.5, 1) - 1) * Math.min(1, 0.9 * amt);
+  k.cs = cmed ? 1 + (clamp(32 / cmed, 0.95, 1.35) - 1) * Math.min(1, 0.8 * amt) : 1;
   const Ln = nblur(Ls, Ws, sw, sh, 4), Wn = box(Ws, sw, sh, 4);
   const lowAt = (fx, fy) => {
     const x = clamp((fx + .5) / W * sw - .5, 0, sw - 1), y = clamp((fy + .5) / H * sh - .5, 0, sh - 1), x0 = x | 0, y0 = y | 0, x1 = Math.min(sw - 1, x0 + 1), y1 = Math.min(sh - 1, y0 + 1), tx = x - x0, ty = y - y0;
     const bi = (A) => (A[y0 * sw + x0] * (1 - tx) + A[y0 * sw + x1] * tx) * (1 - ty) + (A[y1 * sw + x0] * (1 - tx) + A[y1 * sw + x1] * tx) * ty;
     return [bi(Ln), bi(Wn)];
   };
-  const X = { W, H, coef, alphaAt, k, wb, lowAt, keepBg };
+  const X = { W, H, coef, alphaAt, k, wb, lowAt, keepBg: keepBg && !bgColor, bgColor };
   let specks = 0, reflections = 0, marks = 0;
   for (let ty = 0; ty < ny; ty++) for (let tx = 0; tx < nx; tx++) {
     const x0 = tx * TILE, y0 = ty * TILE, x1 = Math.min(W, x0 + TILE), y1 = Math.min(H, y0 + TILE);
