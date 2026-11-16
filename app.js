@@ -1,4 +1,4 @@
-import { runPipeline } from './auto.js?v=1';
+import { runPipeline, squareLayout } from './auto.js?v=2';
 
 const $ = id => document.getElementById(id);
 const done = [];                       // {name, blob}
@@ -23,7 +23,7 @@ function thumb(canvasOrBmp, w, h, max = 600) {
   const g = t.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(canvasOrBmp, 0, 0, t.width, t.height); return t;
 }
 
-async function processOne(file, ui, strength, bgMode) {
+async function processOne(file, ui, strength, bgMode, cvMode) {
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }), W = bmp.width, H = bmp.height;
   ui.orig.replaceChildren(thumb(bmp, W, H));
   const src = document.createElement('canvas'); src.width = W; src.height = H;
@@ -40,8 +40,17 @@ async function processOne(file, ui, strength, bgMode) {
     putTile: (x, y, w, h, rgba) => og.putImageData(new ImageData(rgba, w, h), x, y),
     progress: (label, f) => (ui.meta.firstChild.textContent = `${label}… %${Math.round(f * 100)}`)
   });
-  ui.res.replaceChildren(thumb(out, W, H));
-  const blob = await new Promise(res => out.toBlob(res, 'image/png'));
+  let fin = out;
+  if (cvMode === 'kare' && r.bbox[2] > 0) {                           // standart kare tuval: her ürün aynı boyutta ve ortalı
+    const S = 2048, L = squareLayout(r.bbox, W, H, S), c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d'), px = small.px, n = small.w, m = small.h;
+    const fill = bgMode === 'beyaz' ? [255, 255, 255] : bgMode === 'krem' ? [252, 244, 235] : bgMode === 'koru'
+      ? [0, 1, 2].map(k => Math.round((px[k] + px[(n - 1) * 4 + k] + px[(m - 1) * n * 4 + k] + px[((m - 1) * n + n - 1) * 4 + k]) / 4)) : null;
+    if (fill) { g.fillStyle = `rgb(${fill[0]},${fill[1]},${fill[2]})`; g.fillRect(0, 0, S, S); }
+    g.imageSmoothingQuality = 'high'; g.drawImage(out, L.sx, L.sy, L.sw, L.sh, L.dx, L.dy, L.dw, L.dh); fin = c;
+  }
+  ui.res.replaceChildren(thumb(fin, fin.width, fin.height));
+  const blob = await new Promise(res => fin.toBlob(res, 'image/png'));
   if (!blob) throw new Error('Tarayıcı bu boyutta PNG üretemedi.');
   const base = file.name.replace(/\.[^.]+$/, '');
   done.push({ name: base + '_temiz.png', blob });
@@ -51,9 +60,9 @@ async function processOne(file, ui, strength, bgMode) {
 
 $('file').addEventListener('change', async e => {
   const files = [...e.target.files]; if (!files.length || busy) return; busy = true; e.target.value = '';
-  const strength = $('strength').value, bgMode = $('bgmode').value, cards = files.map(f => addCard(f.name));
+  const strength = $('strength').value, bgMode = $('bgmode').value, cvMode = $('cvmode').value, cards = files.map(f => addCard(f.name));
   for (let i = 0; i < files.length; i++) {
-    try { await processOne(files[i], cards[i], strength, bgMode); }
+    try { await processOne(files[i], cards[i], strength, bgMode, cvMode); }
     catch (err) { console.error(err); cards[i].meta.textContent = 'Hata: ' + (err?.message || err); }
   }
   busy = false; $('zip').disabled = !done.length || typeof JSZip === 'undefined';
